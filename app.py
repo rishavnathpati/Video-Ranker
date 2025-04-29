@@ -209,7 +209,11 @@ def main() -> None:
                             if k.startswith(f'radio_{sid}_'):
                                 del st.session_state[k]
                         st.success("Saved! 🎉")
-                        st.experimental_rerun()
+                        # Backward compatible rerun
+                        try:
+                            st.rerun()  # new name (≥1.25)
+                        except AttributeError:
+                            st.experimental_rerun()  # fallback for old versions
             else:
                 st.info("Rank all four videos to enable Submit.")
 
