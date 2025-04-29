@@ -1,282 +1,239 @@
-import streamlit as st
-import pandas as pd
+# -------------------- app.py --------------------
+import random
 import sqlite3
 import uuid
-import random
-from pathlib import Path
 from datetime import datetime
-import streamlit.components.v1 as components
+from pathlib import Path
 
-# --- Configuration ---
-DB_FILE = "votes.db"
-SLIDES_FILE = "slides.csv"
-GDRIVE_BASE_URL = "https://drive.google.com/uc?export=download&id={}"
-REQUIRED_RANKS = {1, 2, 3, 4}
+import pandas as pd
+import streamlit as st
+from streamlit.components.v1 import iframe  # only used in admin view
 
-# --- Database Setup ---
-def get_db_connection():
-    """Establishes a connection to the SQLite database."""
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False) # Allow access from multiple threads if Streamlit uses them
-    conn.row_factory = sqlite3.Row # Return rows as dictionary-like objects
-    return conn
+# ── CONFIG ────────────────────────────────────────────────────────────
+DB_FILE      = "votes.db"
+SLIDES_FILE  = "slides.csv"      # columns: slide_id,model_id,gdrive_file_id
+GDRIVE_RAW   = "https://drive.google.com/uc?export=download&id={}"
+REQ_RANKS    = {1, 2, 3, 4}
 
-def init_db():
-    """Initializes the database table if it doesn't exist."""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS votes (
-            vote_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id TEXT NOT NULL,
-            slide_id INTEGER NOT NULL,
-            model_id TEXT NOT NULL,
-            rank INTEGER NOT NULL,
-            points INTEGER NOT NULL, -- Calculated in Python before insert
-            voted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-    """)
-    # Optional: Add indexes for faster querying if data grows
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_user_slide ON votes (user_id, slide_id);")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_model ON votes (model_id);")
-    conn.commit()
-    conn.close()
+# ── GLOBAL STYLE (one string, fixes the CSS NameError) ────────────────
+CSS = """
+<style>
+/* compact page */
+main .block-container{padding-top:1rem;padding-bottom:1rem;max-width:100%;}
+header, #MainMenu, footer{visibility:hidden;}
+/* radios side-by-side + highlight selected */
+.stRadio>div{flex-direction:row;justify-content:center;}
+label[data-baseweb="radio"]{margin-right:.8rem;}
+label[data-selected="true"] span{background:#ff4b4b;color:#fff;padding:2px 6px;border-radius:3px;}
+/* 2-col grid tight spacing */
+[data-testid="column"]{width:calc(50% - .5rem)!important;flex:1 1 calc(50% - .5rem)!important;}
+[data-testid="column"]>div{background:#fff;border-radius:6px;padding:.5rem;margin:.25rem;
+                            box-shadow:0 1px 2px rgba(0,0,0,.12);}
+.stButton button{font-weight:bold;font-size:12px;padding:2px 4px;}
+</style>
+"""
 
-# --- Data Loading ---
-@st.cache_data
-def load_slides(csv_path):
-    """Loads slide data from CSV and constructs video URLs."""
-    try:
-        df = pd.read_csv(csv_path)
-        # Validate columns
-        if not {'slide_id', 'model_id', 'gdrive_file_id'}.issubset(df.columns):
-            st.error(f"Error: {csv_path} must contain 'slide_id', 'model_id', and 'gdrive_file_id' columns.")
-            return pd.DataFrame() # Return empty dataframe on error
+# ── DB HELPERS ────────────────────────────────────────────────────────
+@st.cache_resource(show_spinner=False)
+def get_conn(db_path: str = DB_FILE) -> sqlite3.Connection:
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS votes(
+              vote_id INTEGER PRIMARY KEY AUTOINCREMENT,
+              user_id TEXT, slide_id INT, model_id TEXT,
+              rank INT, points INT,
+              voted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"""
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_user_slide ON votes(user_id,slide_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_model       ON votes(model_id)")
+    return conn  # DO NOT close – kept alive by Streamlit
 
-        # Construct Google Drive URL - Use .loc to avoid SettingWithCopyWarning
-        df['url'] = df['gdrive_file_id'].apply(lambda file_id: GDRIVE_BASE_URL.format(file_id))
-        return df
-    except FileNotFoundError:
-        st.error(f"Error: Slides file '{csv_path}' not found. Please create it.")
-        return pd.DataFrame()
-    except Exception as e:
-        st.error(f"Error loading slides: {e}")
-        return pd.DataFrame()
-
-# --- Application Logic ---
-def get_blind_order(slide_id, models_list):
-    """Gets or generates a shuffled order for models for a given slide and session."""
-    session_key = f"order_{slide_id}"
-    if session_key not in st.session_state.order:
-        shuffled_list = models_list[:]  # Create a copy
-        random.shuffle(shuffled_list)
-        st.session_state.order[session_key] = shuffled_list
-        # st.write(f"DEBUG: Shuffled order for slide {slide_id}: {shuffled_list}") # Uncomment for debugging
-    return st.session_state.order[session_key]
-
-def record_votes(user_id, slide_id, ranks_dict):
-    """Validates and records votes into the database."""
-    conn = get_db_connection()
-    try:
-        rows_to_insert = []
-        submitted_ranks = set(ranks_dict.values())
-
-        # Validation 1: Check if all ranks 1-4 are present exactly once
-        if submitted_ranks != REQUIRED_RANKS:
-            st.error(f"⚠️ Please assign each rank (1, 2, 3, 4) exactly once for Slide {slide_id}.")
-            return False
-
-        # Validation 2: Check if this user already voted for this slide in DB (optional but good)
-        # For simplicity in this version, we rely on the session state `voted_slides` check primarily.
-        # A DB check could prevent re-voting if the user refreshes after voting but before the session state is fully set.
-        # cursor = conn.cursor()
-        # cursor.execute("SELECT 1 FROM votes WHERE user_id = ? AND slide_id = ?", (user_id, slide_id))
-        # if cursor.fetchone():
-        #     st.warning(f"Votes already recorded for Slide {slide_id} by this user ID.")
-        #     return False # Already voted
-
-        timestamp = datetime.now()
-        for model_id, rank in ranks_dict.items():
-            points = 5 - rank
-            rows_to_insert.append({
-                "user_id": user_id,
-                "slide_id": slide_id,
-                "model_id": str(model_id), # Ensure model_id is string
-                "rank": rank,
-                "points": points,
-                "voted_at": timestamp
-            })
-
-        df_votes = pd.DataFrame(rows_to_insert)
-        df_votes.to_sql("votes", conn, if_exists="append", index=False)
-        conn.commit()
-        st.session_state.voted_slides.add(slide_id) # Mark as voted in session
-        return True
-    except sqlite3.Error as e:
-        st.error(f"Database error while saving votes: {e}")
-        conn.rollback() # Rollback changes on error
+def record_votes(user_id: str, slide_id: int, ranks: dict[int, int]) -> bool:
+    """Validate ranks {model:rank} and write to DB."""
+    if set(ranks.values()) != REQ_RANKS:
+        st.error("⚠️ Please assign each rank (1-4) exactly once.")
         return False
-    finally:
-        conn.close()
+    rows = [
+        (user_id, slide_id, m, r, 5 - r, datetime.utcnow())
+        for m, r in ranks.items()
+    ]
+    conn = get_conn()
+    conn.executemany(
+        "INSERT INTO votes(user_id,slide_id,model_id,rank,points,voted_at) "
+        "VALUES(?,?,?,?,?,?)",
+        rows,
+    )
+    conn.commit()
+    return True
 
-# --- Scoreboard ---
-# @st.cache_data(ttl=30) # Cache scoreboard for 30 seconds for 'live' feel without constant query
-def get_scoreboard():
-    """Queries the database and returns the aggregated scores."""
-    conn = get_db_connection()
+def fetch_scoreboard() -> pd.DataFrame:
+    q = """SELECT model_id,
+                  SUM(points)  AS total_points,
+                  COUNT(*)     AS vote_count,
+                  ROUND(AVG(points),2) AS avg_points
+           FROM votes
+           GROUP BY model_id
+           ORDER BY total_points DESC"""
+    return pd.read_sql_query(q, get_conn())
+
+# ── DATA LOADING ──────────────────────────────────────────────────────
+@st.cache_data(show_spinner=False)
+def load_slides(path: str = SLIDES_FILE) -> pd.DataFrame:
+    if not Path(path).is_file():
+        st.error(f"❌ '{path}' not found.")
+        return pd.DataFrame()
+    df = pd.read_csv(path)
+    needed = {"slide_id", "model_id", "gdrive_file_id"}
+    if not needed.issubset(df.columns):
+        st.error(f"CSV must have columns: {', '.join(needed)}")
+        return pd.DataFrame()
+    df["url"] = df["gdrive_file_id"].apply(lambda fid: GDRIVE_RAW.format(fid))
+    return df
+
+# ── UTILITIES ─────────────────────────────────────────────────────────
+def extract_id(val: str) -> str | None:
+    """Return raw Drive file-id from either a bare id or any share URL."""
+    if "/" not in val and len(val) > 20:
+        return val
     try:
-        query = """
-            SELECT
-                model_id,
-                SUM(points) AS total_points
-            FROM votes
-            GROUP BY model_id
-            ORDER BY total_points DESC;
-        """
-        # Use Pandas to read SQL query directly into a DataFrame
-        score_df = pd.read_sql_query(query, conn)
-        return score_df
-    except (sqlite3.Error, pd.io.sql.DatabaseError) as e:
-        # Handle case where table might not exist yet or other DB errors
-        st.warning(f"Could not retrieve scoreboard yet or DB error: {e}")
-        return pd.DataFrame(columns=['model_id', 'total_points']) # Return empty df
-    finally:
-        conn.close()
+        return next(p for p in val.split("/") if len(p) > 20 and "." not in p)
+    except StopIteration:
+        return None
 
-# --- Main App ---
-st.set_page_config(page_title="Blind Video Test", layout="wide")
+def blind_order(slide_id: int, models: list[str]) -> list[str]:
+    key = f"order_{slide_id}"
+    if key not in st.session_state:
+        st.session_state[key] = random.sample(models, k=len(models))
+    return st.session_state[key]
 
-# Initialize Database
-init_db()
+# ── VIDEO WIDGET ──────────────────────────────────────────────────────
+def video_block(slide_id: int, model: str, label: str, gdrive_id: str, current_rank: int | None, disabled: bool):
+    file_id = extract_id(gdrive_id)
+    if not file_id:
+        st.error("Bad Drive link/ID")
+        return None
+    # 16:9 responsive iframe
+    st.markdown(f"""
+    <div style="position:relative;padding-bottom:56.25%;height:0;overflow:hidden;">
+      <iframe src="https://drive.google.com/file/d/{file_id}/preview"
+              style="position:absolute;top:0;left:0;width:100%;height:100%;border:0;"
+              allowfullscreen></iframe>
+    </div>""", unsafe_allow_html=True)
 
-# Load Slide Data
-slides_df = load_slides(SLIDES_FILE)
+    if disabled:
+        st.markdown(f"**Rank: {current_rank}**")
+        return None
 
-# Initialize Session State if not already done
-if "user_id" not in st.session_state:
-    st.session_state.user_id = str(uuid.uuid4())
-    st.session_state.order = {} # Stores { "order_slide_id": [shuffled_models] }
-    st.session_state.voted_slides = set() # Stores {slide_id} that have been voted on
-    st.session_state.slide_ranks = {} # Stores { slide_id: {model_id: rank} } before submission
+    # radio buttons (horizontal)
+    return st.radio(
+        f"{label} – choose rank",
+        options=[1, 2, 3, 4],
+        index=current_rank - 1 if current_rank else None,
+        horizontal=True,
+        key=f"radio_{slide_id}_{model}",
+    )
 
-st.sidebar.title("📊 Live Scoreboard")
-st.sidebar.write("Points: Rank 1 = 4pts, Rank 2 = 3pts, Rank 3 = 2pts, Rank 4 = 1pt")
-scoreboard_df = get_scoreboard()
-if not scoreboard_df.empty:
-    # Ensure model_id is suitable for index/charting (string)
-    scoreboard_df['model_id'] = scoreboard_df['model_id'].astype(str)
-    # Use model_id directly if it's unique and suitable as identifier
-    st.sidebar.bar_chart(scoreboard_df.set_index('model_id')['total_points'])
-else:
-    st.sidebar.info("No votes recorded yet.")
+# ── MAIN APP ──────────────────────────────────────────────────────────
+def main() -> None:
+    st.set_page_config("Video Ranking Tool", layout="wide")
+    st.markdown(CSS, unsafe_allow_html=True)
 
-st.sidebar.markdown("---")
-st.sidebar.info(f"Your User ID (for this session): `{st.session_state.user_id}`")
+    # Admin view toggle via URL "…?results=true"
+    is_admin = st.query_params.get("results", ["false"])[0].lower() == "true"
+    df_slides = load_slides()
+    if df_slides.empty:
+        st.stop()
 
+    # Initialise session vars
+    st.session_state.setdefault("uid", str(uuid.uuid4()))
+    st.session_state.setdefault("voted", set())        # slides already saved
+    st.session_state.setdefault("rankings", {})        # slide_id → {model:rank}
 
-st.title("🎬 Blind Video Comparison Tool")
-st.markdown("Please watch the 4 videos for each slide below. The order is randomized for each user. Assign a unique rank (1 = Best, 4 = Worst) to each video.")
+    if is_admin:
+        show_admin()
+        return
 
-if slides_df.empty:
-    st.warning("No slide data loaded. Cannot display tests.")
-else:
-    unique_slide_ids = slides_df['slide_id'].unique()
-    unique_slide_ids.sort() # Process slides in order
+    st.title("🎬 Video Ranking Tool")
 
-    for slide_id in unique_slide_ids:
-        st.divider() # Visually separate slides
-        slide_voted = slide_id in st.session_state.voted_slides
-        header_text = f"Slide {slide_id}"
-        if slide_voted:
-            header_text += " (✅ Voted)"
-        st.header(header_text)
+    for sid in sorted(df_slides["slide_id"].unique()):
+        st.divider()
+        voted = sid in st.session_state.voted
+        st.header(f"Slide {sid} {'✅' if voted else ''}", anchor=False)
 
-        # Get models specific to this slide
-        slide_models_df = slides_df[slides_df['slide_id'] == slide_id]
-        models_for_slide = slide_models_df['model_id'].tolist()
+        subset = df_slides.query("slide_id == @sid")
+        models = subset["model_id"].tolist()
 
-        # Ensure 4 models per slide as per design
-        if len(models_for_slide) != 4:
-             st.error(f"Configuration Error: Slide {slide_id} does not have exactly 4 models defined in {SLIDES_FILE}. Skipping this slide.")
-             continue
+        # ensure 4 videos
+        if len(models) != 4:
+            st.error("This slide does not have exactly 4 videos; skipping.")
+            continue
 
-        # Get the randomized order for display
-        shuffled_model_ids = get_blind_order(slide_id, models_for_slide)
+        # ensure rankings dict exists
+        st.session_state.rankings.setdefault(sid, {})
 
-        # Initialize ranks for this slide if not already done
-        if slide_id not in st.session_state.slide_ranks:
-             st.session_state.slide_ranks[slide_id] = {model_id: 0 for model_id in models_for_slide} # 0 = unranked
-
-        # Display videos and ranking widgets side-by-side
-        cols = st.columns(4)
-        current_ranks = st.session_state.slide_ranks[slide_id] # Get current ranks for this slide
-
-        for i, model_id in enumerate(shuffled_model_ids):
-            with cols[i]:
-                # Get data for the current model
-                row = slide_models_df.loc[slide_models_df['model_id'] == model_id].iloc[0]
-                gdrive_link_or_id = row['gdrive_file_id'] # This might be a full URL or just an ID
-
-                # Extract the actual file ID
-                try:
-                    # Assume it might be a full URL like /file/d/ID/view... or just the ID
-                    parts = gdrive_link_or_id.split('/')
-                    file_id = next(p for p in reversed(parts) if p and '?' not in p and '=' not in p and len(p) > 20) # Find the likely ID
-                    if not file_id:
-                        raise ValueError("Could not extract file ID")
-                except Exception:
-                     st.error(f"Could not extract GDrive File ID from: {gdrive_link_or_id}")
-                     file_id = None # Prevent further errors
-
-                # Using a placeholder text that doesn't reveal the model_id
-                st.subheader(f"Video Option {i+1}")
-                if file_id:
-                    try:
-                        # Use iframe with preview URL
-                        preview_url = f"https://drive.google.com/file/d/{file_id}/preview"
-                        components.iframe(preview_url, height=315) # Adjust height if needed
-                    except Exception as e:
-                        st.error(f"Could not load video {i+1}. GDrive ID: {file_id}. Error: {e}")
-                else:
-                    st.warning(f"Skipping video {i+1} due to GDrive ID extraction error.")
-
-                # Use st.selectbox for ranking to easily see current selection
-                rank_key = f"rank_{slide_id}_{model_id}"
-                selected_rank = st.selectbox(
-                    f"Rank Video Option {i+1}",
-                    options=[0, 1, 2, 3, 4], # Include 0 for 'unranked'
-                    format_func=lambda x: f"Rank {x}" if x > 0 else "Select Rank",
-                    index=current_ranks[model_id], # Set initial value from session state
-                    key=rank_key,
-                    disabled=slide_voted # Disable if already voted
+        # 2×2 grid
+        cols = st.columns(2) + st.columns(2)
+        changed = False
+        for col, model, idx in zip(cols, blind_order(sid, models), range(4)):
+            with col:
+                gid = subset.loc[subset.model_id == model, "gdrive_file_id"].iloc[0]
+                new_rank = video_block(
+                    slide_id=sid,
+                    model=model,
+                    label=f"Video {idx+1}",
+                    gdrive_id=gid,
+                    current_rank=st.session_state.rankings[sid].get(model),
+                    disabled=voted,
                 )
-                # Update session state immediately on change (selectbox triggers rerun)
-                st.session_state.slide_ranks[slide_id][model_id] = selected_rank
+                if new_rank and new_rank != st.session_state.rankings[sid].get(model):
+                    # remove this rank from whoever had it
+                    for m, r in st.session_state.rankings[sid].items():
+                        if r == new_rank:
+                            st.session_state.rankings[sid][m] = None
+                    st.session_state.rankings[sid][model] = new_rank
+                    changed = True
 
+        if changed:
+            st.rerun()
 
-        # Submit Button Area for the current slide
-        st.markdown("---") # Small separator before button
-        submit_key = f"submit_{slide_id}"
-        if not slide_voted:
-            if st.button("Submit Ranks for Slide " + str(slide_id), key=submit_key):
-                # Retrieve the latest ranks directly from session state just before submitting
-                ranks_to_submit = st.session_state.slide_ranks[slide_id]
-
-                # Check if any rank is still 0 (unselected)
-                if 0 in ranks_to_submit.values():
-                    st.error(f"⚠️ Please assign a rank (1-4) to all 4 video options for Slide {slide_id}.")
-                else:
-                    # Attempt to record votes
-                    success = record_votes(st.session_state.user_id, slide_id, ranks_to_submit)
-                    if success:
-                        st.success(f"✅ Votes for Slide {slide_id} submitted successfully!")
-                        # Optional: Clear ranks for the slide from session state after successful submission
-                        # st.session_state.slide_ranks[slide_id] = {m: 0 for m in models_for_slide}
-                        st.rerun() # Rerun to update scoreboard and disable widgets
-                    # Error messages (validation, DB error) are handled within record_votes
-
-        elif slide_voted:
-             st.info(f"You have already submitted your rankings for Slide {slide_id}.")
+        # progress + submit
+        if not voted:
+            assigned = [r for r in st.session_state.rankings[sid].values() if r]
+            st.progress(len(assigned) / 4)
+            if len(assigned) == 4:
+                if st.button(f"Submit Slide {sid}", key=f"submit_{sid}", type="primary"):
+                    if record_votes(st.session_state.uid, sid, st.session_state.rankings[sid]):
+                        st.session_state.voted.add(sid)
+                        # Clean up radio keys for this slide
+                        for k in list(st.session_state.keys()):
+                            if k.startswith(f'radio_{sid}_'):
+                                del st.session_state[k]
+                        st.success("Saved! 🎉")
+                        st.experimental_rerun()
+            else:
+                st.info("Rank all four videos to enable Submit.")
 
     st.divider()
-    st.header("✅ Thank You!")
-    st.markdown("All slides processed. You can see the current overall scores in the sidebar.") 
+    st.write("✅ **Thank you for participating!**")
+
+# ── ADMIN / RESULTS VIEW ──────────────────────────────────────────────
+def show_admin():
+    st.title("📊 Live Results")
+    df = fetch_scoreboard()
+    if df.empty:
+        st.info("No votes yet.")
+        return
+    st.bar_chart(df.set_index("model_id")["total_points"])
+    st.dataframe(df.rename(columns={
+        "model_id": "Model",
+        "total_points": "Total Pts",
+        "vote_count": "Votes",
+        "avg_points": "Avg Pts/Vote",
+    }))
+    # optional raw table download
+    csv = df.to_csv(index=False).encode()
+    st.download_button("Download CSV", csv, "scoreboard.csv", "text/csv")
+
+# ── RUN ───────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    main()
